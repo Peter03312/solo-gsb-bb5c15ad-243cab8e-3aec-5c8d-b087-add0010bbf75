@@ -61,6 +61,7 @@
         <button class="tab" id="tab-modal" role="tab" aria-selected="false" type="button">模态审计 <span id="modal-count" class="count">0</span></button>
         <button class="tab" id="tab-visual" role="tab" aria-selected="false" type="button">视觉顺序 <span id="visual-count" class="count">0</span></button>
         <button class="tab" id="tab-clip" role="tab" aria-selected="false" type="button" title="焦点裁剪审计：节点矩形与 iframe 视口及组合祖先 overflow 裁剪区域求交（仅矩形裁剪，不检测元素遮挡）">焦点裁剪 <span id="clip-count" class="count">0</span></button>
+        <button class="tab" id="tab-hit" role="tab" aria-selected="false" type="button" title="焦点命中遮挡审计：在裁剪审计的可见矩形内取中心与内缩四角采样点，逐层进入 open ShadowRoot 做命中测试；结论仅针对采样点">命中遮挡 <span id="hit-count" class="count">0</span></button>
         <button class="tab" id="tab-name" role="tab" aria-selected="false" type="button" title="控件名称审计（button / a[href] / input[type=text]）">名称审计 <span id="name-count" class="count">0</span></button>
         <button class="tab" id="tab-baseline" role="tab" aria-selected="false" type="button">基线对比 <span id="baseline-count" class="count">0</span></button>
       </div>
@@ -96,6 +97,14 @@
         <h3>无法判定（不计入裁剪统计）</h3>
         <ul id="clip-undetermined-list" class="clip-list"></ul>
         <p id="clip-hint" class="diff-hint" role="status"></p>
+      </div>
+      <div id="hit-panel" class="hit-panel" hidden>
+        <p id="hit-meta" class="hit-meta"></p>
+        <h3>命中判定（按 Tab 顺序，中心 + 内缩四角采样）</h3>
+        <ul id="hit-list" class="hit-list"></ul>
+        <h3>无法判定（不计入命中遮挡统计）</h3>
+        <ul id="hit-undetermined-list" class="hit-list"></ul>
+        <p id="hit-hint" class="diff-hint" role="status"></p>
       </div>
       <div id="name-panel" class="name-panel" hidden>
         <p id="name-meta" class="name-meta"></p>

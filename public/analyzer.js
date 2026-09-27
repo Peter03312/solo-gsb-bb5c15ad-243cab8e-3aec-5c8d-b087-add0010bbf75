@@ -30,13 +30,21 @@
  *     client 盒；按剩余面积占原面积比例区分 完整 / 部分裁剪 / 完全裁剪，
  *     并记录实际缩小区域的视口 / 祖先。零面积、或节点及祖先存在
  *     absolute/fixed 定位、非 none 的 transform / clip-path 时标为无法判定。
- *     本轮只判矩形裁剪，不检测其他元素遮挡；
- *  8. 通过 postMessage 与父页面通信：上报路线、接收高亮指令、绘制高亮框。
+ *     本项只判矩形裁剪，不检测其他元素遮挡；
+ *  8. 焦点命中遮挡审计：沿用裁剪审计算出的可见矩形，在其中取中心点与
+ *     内缩四角共 5 个采样点，逐层进入 open ShadowRoot 做命中测试
+ *     （document.elementFromPoint 后沿 open 根 ShadowRoot.elementFromPoint
+ *     逐层 retarget）：命中目标节点本身或其组合后代算可见，命中其他
+ *     元素记录遮挡者；按被遮挡采样点数区分 未见遮挡 / 部分遮挡 / 全部
+ *     遮挡。零可见面积、裁剪审计无法判定、closed ShadowRoot 及无法确认
+ *     归属的命中单列无法判定；结论仅针对采样点；
+ *  9. 通过 postMessage 与父页面通信：上报路线、接收高亮指令、绘制高亮框。
  *
  * 文件顶部的纯函数（parseTabIndexValue / computeOrder / buildDiagnostics /
  * pickActiveModal / computeModalCycle / buildModalDiagnostics /
  * parseRoute / formatRoute / buildShadowDiagnostics / auditVisualOrder /
- * collapseWs / parseIdList / pickNameSource / auditClip）
+ * collapseWs / parseIdList / pickNameSource / auditClip /
+ * buildHitSamples / auditHitOcclusion）
  * 不依赖 DOM，会在 Node 环境下导出，供单元测试使用。
  */
 (function () {
@@ -827,6 +835,221 @@
     return { viewport: viewport, items: items, undetermined: undetermined, stats: stats };
   }
 
+  /* ---------------- 焦点命中遮挡审计（纯函数） ---------------- */
+
+  /** 四角采样点相对可见矩形边缘的内缩比例（1/4 边长） */
+  var HIT_INSET_RATIO = 0.25;
+
+  /** 采样点去重容差（px）：小于该间距的两个点视为同一点 */
+  var HIT_POINT_EPS = 1e-6;
+
+  /**
+   * 在可见矩形内构造采样点：中心点 + 内缩四角（内缩 HIT_INSET_RATIO 边长），
+   * 共 5 个；矩形过小时重合的点按容差去重。
+   *
+   * @param {{left:number,top:number,width:number,height:number}} region 裁剪审计的可见矩形
+   * @param {number=} inset 四角内缩比例（默认 HIT_INSET_RATIO）
+   * @returns {Array<{type:string,x:number,y:number}>} type 为
+   *   center / top-left / top-right / bottom-left / bottom-right
+   */
+  function buildHitSamples(region, inset) {
+    var g = region || {};
+    var left = Number(g.left) || 0;
+    var top = Number(g.top) || 0;
+    var width = Number(g.width) || 0;
+    var height = Number(g.height) || 0;
+    var r = (typeof inset === 'number' && inset > 0 && inset < 0.5) ? inset : HIT_INSET_RATIO;
+    var cx = left + width / 2;
+    var cy = top + height / 2;
+    var ix = width * r;
+    var iy = height * r;
+    var defs = [
+      { type: 'center', x: cx, y: cy },
+      { type: 'top-left', x: left + ix, y: top + iy },
+      { type: 'top-right', x: left + width - ix, y: top + iy },
+      { type: 'bottom-left', x: left + ix, y: top + height - iy },
+      { type: 'bottom-right', x: left + width - ix, y: top + height - iy }
+    ];
+    var out = [];
+    defs.forEach(function (p) {
+      var dup = out.some(function (q) {
+        return Math.abs(q.x - p.x) <= HIT_POINT_EPS && Math.abs(q.y - p.y) <= HIT_POINT_EPS;
+      });
+      if (!dup) out.push({ type: p.type, x: round2(p.x), y: round2(p.y) });
+    });
+    return out;
+  }
+
+  /**
+   * 焦点命中遮挡审计（纯函数）：在裁剪审计的可见矩形内，对中心 + 内缩四角
+   * 采样点的命中测试结果做汇总判定。命中目标节点本身或其组合后代算可见，
+   * 命中其他元素记录遮挡者；结论仅针对采样点。
+   *
+   * @param {Array} nodes Tab 顺序中的节点（数组顺序即 Tab 顺序），每个为：
+   *   { step, selector, label,
+   *     clipStatus:'full'|'partial'|'clipped'|'undetermined', 裁剪审计状态
+   *     clipReason:(string|null),                             undetermined 时的原因码
+   *     clipMessage:(string|null),                            undetermined 时的说明
+   *     visible:{left,top,width,height},                      裁剪审计的可见矩形
+   *     samples:[{type,x,y,result:'visible'|'occluded'|'unknown',
+   *               occluder:{label,selector}|null, reason:(string|null)}] }
+   *   clipStatus 为 undetermined / clipped 的节点无需提供 samples。
+   * @param {{inset?:number}} options
+   *
+   * 判定规则：
+   *  1. 裁剪审计无法判定（clipStatus='undetermined'）→ 无法判定，
+   *     reason='clip-undetermined'（沿用裁剪原因）；
+   *  2. 可见矩形面积为零（clipStatus='clipped' 或矩形宽 / 高 ≤ 0）→
+   *     无法判定（zero-visible-area）；
+   *  3. 采样点全部可见 → clear（未见遮挡）；
+   *     部分可见、部分被遮挡 → partial（部分遮挡）；
+   *     全部被遮挡 → occluded（全部遮挡）；
+   *  4. 存在无法确认归属的命中（closed ShadowRoot / null / 异常）→
+   *     无法判定：closed 根命中 reason='closed-root'，其余
+   *     'unattributable-hit'（无法确认归属，不猜测）。
+   *
+   * @returns {{inset:number, items:Array, undetermined:Array, stats:object}}
+   */
+  function auditHitOcclusion(nodes, options) {
+    var inset = (options && typeof options.inset === 'number') ? options.inset : HIT_INSET_RATIO;
+    var items = [];
+    var undetermined = [];
+
+    /** 采样点数组中的遮挡者按出现次数（再按标签、选择器）聚合计数 */
+    function collectOccluders(samples) {
+      var map = Object.create(null);
+      samples.forEach(function (s) {
+        if (s.result !== 'occluded' || !s.occluder) return;
+        var key = s.occluder.selector || s.occluder.label;
+        if (!map[key]) {
+          map[key] = { label: s.occluder.label, selector: s.occluder.selector || null, count: 0 };
+        }
+        map[key].count++;
+      });
+      return Object.keys(map).map(function (k) { return map[k]; })
+        .sort(function (a, b) {
+          return b.count - a.count ||
+            String(a.label).localeCompare(String(b.label)) ||
+            String(a.selector || '').localeCompare(String(b.selector || ''));
+        });
+    }
+
+    function pushUndetermined(n, reason, message, samples) {
+      undetermined.push({
+        step: n.step,
+        selector: n.selector,
+        label: n.label,
+        reason: reason,
+        clipReason: n.clipReason || null,
+        message: message,
+        samples: (samples || []).map(function (s) {
+          return {
+            type: s.type, x: s.x, y: s.y, result: s.result,
+            occluder: s.occluder || null, reason: s.reason || null
+          };
+        })
+      });
+    }
+
+    (nodes || []).forEach(function (n) {
+      var step = n && n.step;
+      var selector = (n && n.selector) || null;
+      var label = (n && n.label) || null;
+
+      // 1) 裁剪审计无法判定：可见矩形不可信，不做命中遮挡判定
+      if (n.clipStatus === 'undetermined') {
+        pushUndetermined(n, 'clip-undetermined',
+          '裁剪审计无法判定（' + (n.clipReason || '未知原因') +
+          '）：可见矩形不可确认，命中遮挡无法判定' +
+          (n.clipMessage ? '；' + n.clipMessage : ''));
+        return;
+      }
+
+      var v = n.visible || {};
+      var visible = {
+        left: Number(v.left) || 0,
+        top: Number(v.top) || 0,
+        width: Number(v.width) || 0,
+        height: Number(v.height) || 0
+      };
+
+      // 2) 零可见面积：没有可做命中测试的区域
+      if (!(visible.width > 0) || !(visible.height > 0) || n.clipStatus === 'clipped') {
+        pushUndetermined(n, 'zero-visible-area',
+          '裁剪审计后可见面积为零（' + (n.clipStatus === 'clipped' ? '完全裁剪' : '可见矩形宽 / 高为 0') +
+          '），没有可做命中测试的采样区域');
+        return;
+      }
+
+      var samples = (n.samples || []).map(function (s) {
+        return {
+          type: s.type,
+          x: s.x,
+          y: s.y,
+          result: s.result,
+          occluder: s.occluder || null,
+          reason: s.reason || null
+        };
+      });
+
+      // 防御：没有有效采样点（不应发生）也不臆测
+      if (samples.length === 0) {
+        pushUndetermined(n, 'unattributable-hit',
+          '可见矩形内未取到任何采样点，命中遮挡无法判定');
+        return;
+      }
+
+      var visibleCount = 0;
+      var occludedCount = 0;
+      var unknownSamples = [];
+      samples.forEach(function (s) {
+        if (s.result === 'visible') visibleCount++;
+        else if (s.result === 'occluded') occludedCount++;
+        else unknownSamples.push(s);
+      });
+
+      // 4) 无法确认归属的命中（closed 根 / null 等）：不猜测，单列无法判定
+      if (unknownSamples.length > 0) {
+        var closedUnknown = unknownSamples.some(function (s) { return s.reason === 'closed-root'; });
+        pushUndetermined(n, closedUnknown ? 'closed-root' : 'unattributable-hit',
+          closedUnknown
+            ? '有采样点命中 closed ShadowRoot 宿主，闭合边界内部命中归属不可检查，命中遮挡无法判定'
+            : '有采样点的命中目标无法确认归属（命中 null 或命中测试异常），命中遮挡无法判定',
+          samples);
+        return;
+      }
+
+      // 3) 全部可见 → 未见遮挡；部分可见 → 部分遮挡；全部被遮挡 → 全部遮挡
+      var status = visibleCount === samples.length ? 'clear'
+        : occludedCount === samples.length ? 'occluded' : 'partial';
+      items.push({
+        step: step,
+        selector: selector,
+        label: label,
+        status: status,
+        clipStatus: n.clipStatus,
+        visible: visible,
+        sampleCount: samples.length,
+        visibleCount: visibleCount,
+        occludedCount: occludedCount,
+        occluders: collectOccluders(samples),
+        samples: samples
+      });
+    });
+
+    var stats = {
+      nodes: (nodes || []).length,
+      judged: items.length,
+      clear: 0,
+      partial: 0,
+      occluded: 0,
+      undetermined: undetermined.length
+    };
+    items.forEach(function (it) { stats[it.status]++; });
+
+    return { inset: inset, items: items, undetermined: undetermined, stats: stats };
+  }
+
 
   // Node 环境：导出纯函数供测试，随后退出（不触碰 DOM）。
   if (typeof window === 'undefined' || typeof document === 'undefined') {
@@ -845,7 +1068,9 @@
         collapseWs: collapseWs,
         parseIdList: parseIdList,
         pickNameSource: pickNameSource,
-        auditClip: auditClip
+        auditClip: auditClip,
+        buildHitSamples: buildHitSamples,
+        auditHitOcclusion: auditHitOcclusion
       };
     }
     return;
@@ -1901,16 +2126,17 @@
   /* ---------------- 焦点裁剪审计（DOM 采集） ---------------- */
 
   /**
-   * 焦点裁剪审计：以重算时布局为准（只读布局，不自动滚动）。
-   * 对 Tab 顺序中的每个节点采集：
+   * 采集焦点裁剪 / 命中遮挡审计共用的节点数据：以重算时布局为准（只读布局，
+   * 不自动滚动）。对 Tab 顺序中的每个节点采集：
    *  - 边界矩形（getBoundingClientRect，视口坐标）与自身计算样式关键值；
    *  - 组合祖先链（沿 slot 分配、open ShadowRoot 宿主上溯，复用 composedParent）
    *    的计算样式关键值（position / transform / clip-path / overflow-x/y），
    *    并在某轴 overflow 属于裁剪集合（hidden/clip/auto/scroll）时采集
-   *    扣除边框与滚动条的 client 盒（clientLeft/Top + clientWidth/Height）；
-   * 随后交给纯函数 auditClip 判定。iframe 视口取 window.innerWidth/Height。
+   *    扣除边框与滚动条的 client 盒（clientLeft/Top + clientWidth/Height）。
+   * 节点保留 DOM 引用（el）供命中遮挡审计做命中测试；纯函数输出不会序列化它。
+   * iframe 视口取 window.innerWidth/Height。
    */
-  function computeClipAudit() {
+  function buildClipNodes() {
     var viewport = {
       width: round2(Math.max(0, window.innerWidth || 0)),
       height: round2(Math.max(0, window.innerHeight || 0))
@@ -1952,6 +2178,7 @@
         step: i + 1,
         selector: e.selector,
         label: e.label,
+        el: el,
         rect: {
           left: round2(r.left),
           top: round2(r.top),
@@ -1962,7 +2189,137 @@
         ancestors: ancestors
       });
     }
-    return auditClip(nodes, { viewport: viewport });
+    return { viewport: viewport, nodes: nodes };
+  }
+
+  function computeClipAudit() {
+    var data = buildClipNodes();
+    return auditClip(data.nodes, { viewport: data.viewport });
+  }
+
+  /* ---------------- 焦点命中遮挡审计（DOM 采集） ---------------- */
+
+  /**
+   * 组合命中测试（视口坐标）：document.elementFromPoint 得到顶层命中元素后，
+   * 逐层进入 open ShadowRoot（ShadowRoot.elementFromPoint）做 retarget：
+   *  - 命中目标节点本身，或命中目标「组合后代」（物理后代 / slot 分配到目标
+   *    内的轻 DOM 节点）→ { result:'visible' }；
+   *  - 命中 closed ShadowRoot 宿主（闭合边界无法继续 retarget）→
+   *    { result:'unknown', reason:'closed-root' }；
+   *  - 命中 null / 抛错（点不在视口等）→ unknown / unattributable-hit；
+   *  - 其余命中元素（含目标的祖先）一律记为遮挡者。
+   */
+  function hitTestComposed(x, y, target) {
+    var el;
+    try {
+      el = document.elementFromPoint(x, y);
+    } catch (err) {
+      return { result: 'unknown', reason: 'unattributable-hit', occluder: null };
+    }
+    if (!el) return { result: 'unknown', reason: 'unattributable-hit', occluder: null };
+
+    var guard = 0;
+    while (el && el.nodeType === 1 && guard++ < 200) {
+      // closed shadow root 宿主：无法进入闭合边界，命中归属不可检查（不猜测）
+      if (isClosedHost(el)) {
+        return { result: 'unknown', reason: 'closed-root', occluder: null };
+      }
+      // 命中目标本身或其组合后代 → 可见（祖先命中不算，按遮挡处理）
+      if (el === target || containsComposed(target, el)) {
+        return { result: 'visible', occluder: null, reason: null };
+      }
+      // 逐层进入命中元素自身的 open ShadowRoot retarget（命中元素为宿主）
+      var sr = el.shadowRoot;
+      if (sr && typeof sr.elementFromPoint === 'function') {
+        var inner = null;
+        try {
+          inner = sr.elementFromPoint(x, y);
+        } catch (e2) {
+          inner = null;
+        }
+        if (inner && inner !== el) {
+          el = inner;
+          continue;
+        }
+      }
+      return {
+        result: 'occluded',
+        reason: null,
+        occluder: { label: describe(el).css, selector: stableRoute(el) }
+      };
+    }
+    return { result: 'unknown', reason: 'unattributable-hit', occluder: null };
+  }
+
+  /**
+   * 焦点命中遮挡审计：沿用裁剪审计的可见矩形，在其中取中心 + 内缩四角
+   * 采样点（buildHitSamples），逐点做跨 open ShadowRoot 的组合命中测试，
+   * 再交给纯函数 auditHitOcclusion 汇总。命中测试期间临时隐藏实验室自身
+   * 的高亮覆盖层（其本身 pointer-events:none，双保险）。
+   */
+  function computeHitAudit(clipResult) {
+    var hitNodes = [];
+
+    // 命中测试期间隐藏高亮覆盖层，避免污染命中（结束后还原）
+    var prevOverlayDisplay = null;
+    if (overlay && overlay.isConnected) {
+      prevOverlayDisplay = overlay.style.display;
+      overlay.style.display = 'none';
+    }
+    try {
+      clipResult.items.forEach(function (it) {
+        var idx = order[it.step - 1];
+        var el = idx !== undefined ? entries[idx].el : null;
+        var points = buildHitSamples(it.visible, HIT_INSET_RATIO);
+        var samples = points.map(function (p) {
+          var res = el
+            ? hitTestComposed(p.x, p.y, el)
+            : { result: 'unknown', reason: 'unattributable-hit', occluder: null };
+          return {
+            type: p.type,
+            x: p.x,
+            y: p.y,
+            result: res.result,
+            occluder: res.occluder || null,
+            reason: res.reason || null
+          };
+        });
+        hitNodes.push({
+          step: it.step,
+          selector: it.selector,
+          label: it.label,
+          clipStatus: it.status,
+          clipReason: null,
+          clipMessage: null,
+          visible: it.visible,
+          samples: samples
+        });
+      });
+
+      // 裁剪审计无法判定 / 零面积的节点：纯函数侧直接归入无法判定
+      clipResult.undetermined.forEach(function (u) {
+        hitNodes.push({
+          step: u.step,
+          selector: u.selector,
+          label: u.label,
+          clipStatus: 'undetermined',
+          clipReason: u.reason,
+          clipMessage: u.message,
+          visible: { left: 0, top: 0, width: 0, height: 0 },
+          samples: []
+        });
+      });
+    } finally {
+      if (overlay && overlay.isConnected && prevOverlayDisplay !== null) {
+        overlay.style.display = prevOverlayDisplay;
+      }
+    }
+
+    // items 与 undetermined 分别收集后按 Tab 序号还原顺序
+    hitNodes.sort(function (a, b) { return a.step - b.step; });
+    var result = auditHitOcclusion(hitNodes, { inset: HIT_INSET_RATIO });
+    result.viewport = clipResult.viewport;
+    return result;
   }
 
   /* ---------------- 控件名称审计（DOM，组合树） ---------------- */
@@ -2250,6 +2607,10 @@
         suppressedFallbackCount: sd.suppressedFallbackCandidates
       }).forEach(function (d2) { diagnostics.push(d2); });
 
+      // 命中遮挡审计复用裁剪审计的可见矩形（同一次重算布局，只读、不自动滚动）
+      var clipAudit = computeClipAudit();
+      var hitAudit = computeHitAudit(clipAudit);
+
       post({
         type: 'route',
         payload: {
@@ -2259,7 +2620,8 @@
           modalAudit: computeModalAudit(),
           visualAudit: computeVisualAudit(),
           nameAudit: computeNameAudit(),
-          clipAudit: computeClipAudit(),
+          clipAudit: clipAudit,
+          hitAudit: hitAudit,
           stats: {
             candidates: entries.length,
             ordered: order.length,

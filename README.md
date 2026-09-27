@@ -20,8 +20,13 @@ id 引用与 label 关联仅在控件所属 Document / ShadowRoot 内解析，�
 并以重算时布局为准（不自动滚动）做**焦点裁剪审计**（节点边界矩形依次与
 iframe 视口及全部组合祖先的裁剪区域求交，按剩余面积比例区分
 完整 / 部分裁剪 / 完全裁剪），
+并沿用裁剪审计的可见矩形做**焦点命中遮挡审计**（中心与内缩四角采样点，
+在 iframe 内逐层进入 open ShadowRoot 做命中测试：命中目标或其组合后代算
+可见、命中其他元素记录遮挡者，按被遮挡采样点数区分未见 / 部分 / 全部遮挡；
+零可见面积、closed 根与归属无法确认的命中单列无法判定，结论仅针对采样点），
 可一键导出「节点（含宿主链 / slot 来源）/ 顺序 / 诊断 / 基线对比 / 模态审计 /
-视觉顺序审计 / 控件名称审计 / 焦点裁剪审计 / 组合树汇总」JSON 报告。
+视觉顺序审计 / 控件名称审计 / 焦点裁剪审计 / 焦点命中遮挡审计 / 组合树汇总」
+JSON 报告。
 **closed shadow root 明确标记为不可检查，实验室不猜测其内部焦点顺序。**
 
 ## 快速开始（Docker）
@@ -180,6 +185,29 @@ npm run smoke      # 冒烟测试（需服务已启动）
   - 本轮**只判矩形裁剪，不检测其他元素遮挡**；
   - 点击条目复用**分段选择器高亮**联动预览（实线框 + 状态角标）；
     标签角标计数 = 部分裁剪 + 完全裁剪 + 无法判定数。
+- **焦点命中遮挡审计**：「命中遮挡」标签页沿用同一次重算中**焦点裁剪审计算出
+  的可见矩形**（不重新采集、不自动滚动），对 Tab 顺序中的每个节点做命中遮挡判定：
+  - **采样点**：在可见矩形内取 **5 个采样点**——矩形**中心**与四角各内缩
+    **25% 边长**的点（矩形过小时重合点去重）；
+  - **跨 ShadowRoot 命中测试**：在 iframe 内先 `document.elementFromPoint`，
+    命中 shadow 宿主时进入其 **open ShadowRoot** 的 `elementFromPoint` 逐层
+    retarget（closed 宿主不可进入）；命中**目标节点本身或其组合后代**
+    （物理后代 / 经 slot 分配进入目标的轻 DOM 节点）算**可见**，命中
+    **其他元素**（含目标祖先）记为**遮挡者**（标签 + 分段选择器，按命中
+    采样点数聚合计数）；
+  - **判定分类**：按**被遮挡采样点数**区分 **未见遮挡**（5/5 可见）、
+    **部分遮挡**（部分可见 / 部分被遮挡）、**全部遮挡**（0/5 可见），
+    条目展示可见 / 被遮挡采样点数、遮挡者、逐采样点坐标与结果及所用可见矩形；
+  - **无法判定**（明确列出，不计入遮挡统计）：裁剪审计后**零可见面积**
+    （`zero-visible-area`）、**裁剪审计本身无法判定**（`clip-undetermined`，
+    沿用 zero-size / positioned / transformed / clip-path 原因，不猜测）、
+    采样点命中 **closed ShadowRoot 宿主**（`closed-root`）、命中 null 或
+    命中测试异常等**无法确认归属**的命中（`unattributable-hit`）；同一节点
+    只要有一个采样点归属不明即整节点无法判定（不混入遮挡计数）；
+  - **结论仅针对采样点**：每条结果与导出报告均注明审计范围仅为中心 + 内缩
+    四角 5 个采样点，不代表元素其余位置的命中情况；
+  - 点击条目复用**分段选择器高亮**联动预览（实线框 + 状态角标）；
+    标签角标计数 = 部分遮挡 + 全部遮挡 + 无法判定数。
 - **导出 JSON**：`POST /api/export` 返回 `Content-Disposition: attachment` 的报告文件；
   接口不可用时退化为浏览器本地下载。已钉基线时，报告包含
   `baselineComparison` 字段：`baseline` / `current` 摘要（时间、统计、节点数）、
@@ -207,6 +235,17 @@ npm run smoke      # 冒烟测试（需服务已启动）
   `visible`）、`undetermined`（无法判定节点：原因码 `reason`
   （`zero-size` / `positioned` / `transformed` / `clip-path`）、来源祖先
   `source` 与说明 `message`）与 `stats`（节点数 / 各状态计数）。
+  报告还包含 `hitAudit` 字段：`scopeNote`（结论仅针对采样点的范围说明）、
+  `viewport`（iframe 视口尺寸）、`inset`（四角内缩比例 0.25）、
+  `items`（逐节点命中判定：Tab 序号、分段选择器、状态 `status`
+  （`clear` / `partial` / `occluded`）、裁剪状态、命中区域 `visible`、
+  采样点总数 / 可见数 / 被遮挡数、遮挡者 `occluders`（标签、分段选择器、
+  命中采样点数）与逐采样点 `samples`（类型 `type`、坐标、结果
+  `visible` / `occluded` / `unknown`、遮挡者、无法确认原因））、
+  `undetermined`（无法判定节点：原因码 `reason`
+  （`zero-visible-area` / `clip-undetermined` / `closed-root` /
+  `unattributable-hit`）、沿用的裁剪原因 `clipReason`、说明 `message`
+  与逐采样点明细）与 `stats`（节点数 / 各状态计数）。
   检测到 Shadow DOM 时，报告包含 `shadowDom` 字段（open/closed 根宿主、
   经 slot 分配 / fallback / 未分配 / fallback 抑制计数，closed 根含宿主选择器）；
   每个节点的 `shadow` 对象保留 `hosts`（宿主链：label + 分段选择器）、
@@ -220,14 +259,16 @@ server.js                 Express：静态托管 + /api/health + /api/export
 public/index.html         应用外壳（编辑器 / 预览 / 结果三栏）
 public/app.js             父页面：DSD 感知净化、srcdoc 装配、postMessage 通信、渲染、
                           shadow 徽章（宿主链 / slot 来源）、基线面板、模态审计视图、
-                          控件名称审计视图、焦点裁剪审计视图、导出
+                          控件名称审计视图、焦点裁剪审计视图、焦点命中遮挡审计视图、导出
 public/analyzer.js        注入 sandbox iframe：组合树遍历（open shadow / slot 分配 /
                           fallback / 未分配）、焦点模型、分段选择器、节点身份（含宿主链）、
                           closed 根「不可检查」标记、跨边界模态审计、视觉顺序审计
                           （矩形 / 滚动容器采集、行聚类、LTR/RTL 逆序对检测）、
                           控件名称审计（根内 id / label 解析、组合树文本、
                           隐藏子树规则）、焦点裁剪审计（组合祖先链计算样式与
-                          client 盒采集、视口 / 祖先逐次求交）、高亮绘制
+                          client 盒采集、视口 / 祖先逐次求交）、焦点命中遮挡审计
+                          （中心 + 内缩四角采样、open ShadowRoot 逐层 retarget
+                          命中测试、遮挡者归因）、高亮绘制
 public/diff.js            基线对比纯函数：节点身份匹配（uid → 指纹 → 歧义未匹配）与差异计算
 test/analyzer.test.js     纯函数单元测试（tabindex 解析 / 排序 / 诊断 / 模态审计）
 test/shadow.test.js       Shadow 纯函数单元测试（分段选择器往返 / 组合树诊断）
@@ -239,12 +280,18 @@ test/name.test.js         控件名称审计纯函数单元测试（空白折叠
 test/clip.test.js         焦点裁剪审计单元测试（视口 / 祖先逐次求交、按轴裁剪、
                           完整 / 部分 / 完全裁剪分类与比例、裁剪来源记录、
                           零面积 / 定位 / transform / clip-path 无法判定）
+test/hit.test.js          焦点命中遮挡审计单元测试（中心 + 内缩四角采样构造与
+                          去重、未见 / 部分 / 全部遮挡分类、遮挡者聚合计数、
+                          零可见面积 / 裁剪无法判定 / closed 根 / 归属无法确认）
 test/shadow-integration.js jsdom 集成：组合树遍历 / slot / closed / 跨边界模态（需可选 jsdom）
 test/name-integration.js  jsdom 集成：控件名称审计（来源优先级 / 根内解析 /
                           缺失与重复引用 / 组合树文本与隐藏子树规则）（需可选 jsdom）
 test/clip-integration.js  jsdom 集成：焦点裁剪审计 DOM 采集（组合祖先链 overflow /
                           client 盒扣除边框、跨 open ShadowRoot 上溯、transform 无法判定；
                           几何量以桩代替）（需可选 jsdom）
+test/hit-integration.js   jsdom 集成：焦点命中遮挡审计 DOM 采集（open ShadowRoot
+                          逐层 retarget、全遮 / 半遮判定、closed 宿主与裁剪无法
+                          判定传递；几何量与 elementFromPoint 以桩代替）（需可选 jsdom）
 test/sanitize-dsd.js      jsdom 集成：声明式 Shadow DOM 净化 / 还原（需可选 jsdom）
 test/smoke.js             冒烟测试
 Dockerfile                node:20-alpine，npm install --omit=dev
@@ -252,7 +299,7 @@ docker-compose.yml        单服务，ports 3000:3000
 ```
 
 > 零依赖单元测试：`npm test`（不安装 jsdom）。jsdom 集成验证为可选：
-> `npm install --no-save jsdom && node test/shadow-integration.js && node test/name-integration.js && node test/clip-integration.js && node test/sanitize-dsd.js`
+> `npm install --no-save jsdom && node test/shadow-integration.js && node test/name-integration.js && node test/clip-integration.js && node test/hit-integration.js && node test/sanitize-dsd.js`
 > （jsdom 不支持声明式 `shadowrootmode` 的解析，集成测试用 `attachShadow` 等价构造运行时结构；
 > DSD 模板的保留 / 还原由 `sanitize-dsd.js` 在字符串与 DOMParser 层验证。）
 

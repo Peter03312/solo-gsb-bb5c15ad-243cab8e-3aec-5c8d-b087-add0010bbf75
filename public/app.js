@@ -22,8 +22,14 @@
  *     完全裁剪，含剩余面积比例与实际缩小区域的视口 / 祖先）与无法判定
  *     节点（零面积 / absolute·fixed 定位 / transform / clip-path），
  *     点击条目复用分段选择器联动预览高亮；
- * 10. 汇总报告（含基线摘要、匹配结果与差异、模态审计、视觉顺序审计、
- *     控件名称审计、焦点裁剪审计）经 POST /api/export 导出为 JSON 附件。
+ * 10. 焦点命中遮挡审计：在裁剪审计的可见矩形内取中心 + 内缩四角采样点，
+ *     展示逐节点命中判定（未见遮挡 / 部分遮挡 / 全部遮挡，含遮挡者与
+ *     逐采样点结果）与无法判定节点（零可见面积 / 裁剪无法判定 /
+ *     closed 根 / 归属无法确认），结论仅针对采样点，点击条目复用分段
+ *     选择器联动预览高亮；
+ * 11. 汇总报告（含基线摘要、匹配结果与差异、模态审计、视觉顺序审计、
+ *     控件名称审计、焦点裁剪审计、焦点命中遮挡审计）经 POST /api/export
+ *     导出为 JSON 附件。
  */
 (function () {
   'use strict';
@@ -97,7 +103,14 @@
     clipMeta: document.getElementById('clip-meta'),
     clipList: document.getElementById('clip-list'),
     clipUndeterminedList: document.getElementById('clip-undetermined-list'),
-    clipHint: document.getElementById('clip-hint')
+    clipHint: document.getElementById('clip-hint'),
+    tabHit: document.getElementById('tab-hit'),
+    hitPanel: document.getElementById('hit-panel'),
+    hitCount: document.getElementById('hit-count'),
+    hitMeta: document.getElementById('hit-meta'),
+    hitList: document.getElementById('hit-list'),
+    hitUndeterminedList: document.getElementById('hit-undetermined-list'),
+    hitHint: document.getElementById('hit-hint')
   };
 
   var state = {
@@ -115,7 +128,8 @@
     visualAudit: null,   // 最近一次视觉顺序审计结果
     nameAudit: null,     // 最近一次控件名称审计结果
     clipAudit: null,     // 最近一次焦点裁剪审计结果
-    highlightOrigin: null // 最近一次 highlight-node 请求来源（'diff' / 'modal' / 'visual' / 'name' / 'clip'），用于定位高亮失败提示
+    hitAudit: null,      // 最近一次焦点命中遮挡审计结果
+    highlightOrigin: null // 最近一次 highlight-node 请求来源（'diff' / 'modal' / 'visual' / 'name' / 'clip' / 'hit'），用于定位高亮失败提示
   };
 
   /* ---------------- 示例输入 ---------------- */
@@ -194,6 +208,18 @@
     '</div>',
     '<div class="clip-hidden"><button>overflow:hidden 盒内按钮（横向被裁）</button></div>',
     '<div class="clip-transform"><button>transform 祖先内按钮（无法判定）</button></div>',
+    '<!-- 焦点命中遮挡审计：兄弟元素覆盖在 Tab 节点之上（不影响裁剪矩形），按中心 + 内缩四角采样命中测试 -->',
+    '<div class="hit-demo">',
+    '  <button class="hit-target hit-clear">未被遮挡的按钮（5/5 可见）</button>',
+    '</div>',
+    '<div class="hit-demo">',
+    '  <button class="hit-target hit-half">半幅覆盖的按钮（部分遮挡）</button>',
+    '  <div class="cover cover-half" aria-hidden="true"></div>',
+    '</div>',
+    '<div class="hit-demo">',
+    '  <button class="hit-target hit-full">整片覆盖的按钮（全部遮挡）</button>',
+    '  <div class="cover cover-full" aria-hidden="true">遮挡层</div>',
+    '</div>',
     '<div role="dialog" aria-modal="true" aria-label="订阅确认" class="demo-modal">',
     '  <p><strong>模态对话框</strong>：打开时模态外的节点即为「泄漏」</p>',
     '  <input type="email" placeholder="邮箱地址">',
@@ -213,6 +239,12 @@
     '.clip-hidden { width: 90px; height: 34px; overflow: hidden; border: 3px solid #ffb020; margin: 8px 0; }',
     '.clip-hidden button { width: 220px; }',
     '.clip-transform { display: inline-block; transform: translateX(12px); }',
+    '/* 命中遮挡审计演示：position:relative 容器 + 绝对定位的兄弟遮挡层（遮挡层自身不可聚焦） */',
+    '.hit-demo { position: relative; display: inline-block; margin: 8px 6px; }',
+    '.hit-demo .hit-target { display: block; width: 180px; margin: 0; }',
+    '.hit-demo .cover { position: absolute; pointer-events: auto; background: rgba(255,45,120,.45); border: 2px solid #ff2d78; }',
+    '.hit-demo .cover-half { left: 50%; top: 0; width: 50%; height: 100%; }',
+    '.hit-demo .cover-full { left: 0; top: 0; width: 100%; height: 100%; line-height: 30px; text-align: center; color: #fff; }',
     '.demo-modal { display: block; margin: 8px 0; padding: 10px; border: 2px solid #4f8cff; border-radius: 6px; background: #eef4ff; }',
     ':focus { outline: 2px dashed #4f8cff; }'
   ].join('\n');
@@ -375,6 +407,7 @@
       else if (state.highlightOrigin === 'visual') setVisualHint(missText);
       else if (state.highlightOrigin === 'name') setNameHint(missText);
       else if (state.highlightOrigin === 'clip') setClipHint(missText);
+      else if (state.highlightOrigin === 'hit') setHitHint(missText);
       else setDiffHint(missText);
       state.highlightOrigin = null;
     } else if (d.type === 'error') {
@@ -391,6 +424,7 @@
     state.visualAudit = payload.visualAudit || null;
     state.nameAudit = payload.nameAudit || null;
     state.clipAudit = payload.clipAudit || null;
+    state.hitAudit = payload.hitAudit || null;
     state.stats = payload.stats || null;
     state.currentStep = -1;
     renderResults();
@@ -611,6 +645,7 @@
     renderVisualAudit();
     renderNameAudit();
     renderClipAudit();
+    renderHitAudit();
   }
 
   /* ---------------- 模态焦点陷阱审计 ---------------- */
@@ -1164,6 +1199,225 @@
     });
   }
 
+  /* ---------------- 焦点命中遮挡审计 ---------------- */
+
+  var HIT_STATUS_META = {
+    clear: { label: '未见遮挡', cls: 'hit-clear' },
+    partial: { label: '部分遮挡', cls: 'hit-partial' },
+    occluded: { label: '全部遮挡', cls: 'hit-occluded' }
+  };
+  var HIT_REASON_META = {
+    'zero-visible-area': { label: '零可见面积', cls: 'hit-zero' },
+    'clip-undetermined': { label: '裁剪无法判定', cls: 'hit-clip-undetermined' },
+    'closed-root': { label: 'closed 根', cls: 'hit-closed' },
+    'unattributable-hit': { label: '归属无法确认', cls: 'hit-unattributable' }
+  };
+  var HIT_SAMPLE_LABELS = {
+    center: '中心',
+    'top-left': '内缩左上',
+    'top-right': '内缩右上',
+    'bottom-left': '内缩左下',
+    'bottom-right': '内缩右下'
+  };
+  // 结论仅针对中心 + 内缩四角 5 个采样点，不代表元素整体任意位置的命中情况
+  var HIT_SCOPE_NOTE = '结论仅针对采样点（中心 + 内缩四角，元素其余位置不在审计范围内）';
+
+  function setHitHint(text) {
+    els.hitHint.textContent = text || '';
+  }
+
+  function clearHitActive() {
+    var all = els.hitPanel.querySelectorAll('.diff-item.active');
+    for (var i = 0; i < all.length; i++) all[i].classList.remove('active');
+  }
+
+  /** 遮挡者说明：div.cover（遮挡 5/5 个采样点）；多个遮挡者以「；」分隔 */
+  function hitOccludersText(occluders, total) {
+    return (occluders || []).map(function (o) {
+      return o.label + '（遮挡 ' + o.count + '/' + total + ' 个采样点）';
+    }).join('；');
+  }
+
+  /** 单个采样点结果短标签：✓ 中心 / ✗ 内缩左上：div.cover / ? closed 根 */
+  function hitSampleText(sample) {
+    var name = HIT_SAMPLE_LABELS[sample.type] || sample.type;
+    if (sample.result === 'visible') return '✓ ' + name;
+    if (sample.result === 'occluded') {
+      return '✗ ' + name + '：' + ((sample.occluder && sample.occluder.label) || '其他元素');
+    }
+    return '? ' + name + '：' + (sample.reason === 'closed-root' ? 'closed 根' : '归属无法确认');
+  }
+
+  function renderHitAudit() {
+    var audit = state.hitAudit;
+    els.hitList.innerHTML = '';
+    els.hitUndeterminedList.innerHTML = '';
+    els.hitMeta.textContent = '';
+    // 默认即注明结论仅针对采样点（点击条目后保持该说明，高亮失败时临时替换）
+    setHitHint(HIT_SCOPE_NOTE);
+
+    if (!audit) {
+      els.hitCount.textContent = '0';
+      var tip0 = document.createElement('li');
+      tip0.className = 'empty-tip';
+      tip0.textContent = '尚无审计结果。';
+      els.hitList.appendChild(tip0);
+      return;
+    }
+
+    var items = audit.items || [];
+    var unds = audit.undetermined || [];
+    var st = audit.stats || {};
+    var totalNodes = st.nodes || 0;
+    // 角标计数 = 部分遮挡 + 全部遮挡 + 无法判定
+    els.hitCount.textContent = String((st.partial || 0) + (st.occluded || 0) + (st.undetermined || 0));
+    var vp = audit.viewport;
+    els.hitMeta.textContent =
+      'iframe 视口 ' + (vp ? vp.width + '×' + vp.height : '未知') +
+      ' · Tab 节点 ' + totalNodes +
+      ' · 未见遮挡 ' + (st.clear || 0) +
+      ' · 部分遮挡 ' + (st.partial || 0) +
+      ' · 全部遮挡 ' + (st.occluded || 0) +
+      ' · 无法判定 ' + (st.undetermined || 0) +
+      ' · 每节点 5 采样点（中心 + 内缩 ' + Math.round((audit.inset || 0.25) * 100) + '% 四角）';
+
+    // 命中判定列表（按 Tab 顺序）
+    if (totalNodes === 0) {
+      var tipN = document.createElement('li');
+      tipN.className = 'empty-tip';
+      tipN.textContent = '当前没有可 Tab 聚焦的节点，无需命中遮挡审计。';
+      els.hitList.appendChild(tipN);
+    } else if (items.length === 0) {
+      var tipAll = document.createElement('li');
+      tipAll.className = 'empty-tip';
+      tipAll.textContent = '没有可判定的节点（全部无法判定，见下方列表）。';
+      els.hitList.appendChild(tipAll);
+    }
+    items.forEach(function (it) {
+      var meta = HIT_STATUS_META[it.status] || { label: it.status, cls: '' };
+      var li = document.createElement('li');
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'diff-item ' + meta.cls;
+
+      var line = document.createElement('span');
+      var no = document.createElement('span');
+      no.className = 'step-no';
+      no.textContent = String(it.step);
+      line.appendChild(no);
+      line.appendChild(document.createTextNode(' ' + (it.label || '')));
+      var badge = document.createElement('span');
+      badge.className = 'type-badge ' + meta.cls;
+      badge.textContent = meta.label;
+      line.appendChild(badge);
+      var ratio = document.createElement('span');
+      ratio.className = 'badge hit-ratio';
+      ratio.textContent = '可见 ' + it.visibleCount + '/' + it.sampleCount +
+        ' · 被遮挡 ' + it.occludedCount + '/' + it.sampleCount;
+      line.appendChild(ratio);
+      btn.appendChild(line);
+
+      if (it.status !== 'clear' && it.occluders && it.occluders.length > 0) {
+        var occ = document.createElement('span');
+        occ.className = 'diff-detail';
+        occ.textContent = '遮挡者：' + hitOccludersText(it.occluders, it.sampleCount);
+        btn.appendChild(occ);
+      }
+      var pts = document.createElement('span');
+      pts.className = 'diff-detail hit-samples';
+      pts.textContent = (it.samples || []).map(hitSampleText).join('　');
+      btn.appendChild(pts);
+      var area = document.createElement('span');
+      area.className = 'diff-detail';
+      area.textContent = '命中区域（裁剪审计可见矩形）：' + it.visible.left + ',' + it.visible.top +
+        ' ' + it.visible.width + '×' + it.visible.height;
+      btn.appendChild(area);
+
+      var sel = document.createElement('span');
+      sel.className = 'sel';
+      sel.textContent = it.selector;
+      btn.appendChild(sel);
+
+      // 复用分段选择器高亮（实线框 + 状态角标）
+      btn.addEventListener('click', function () {
+        clearHitActive();
+        btn.classList.add('active');
+        setHitHint(HIT_SCOPE_NOTE);
+        state.highlightOrigin = 'hit';
+        sendToFrame({
+          type: 'highlight-node',
+          selector: it.selector,
+          badge: meta.label + ' · Tab ' + it.step + ' / ' + totalNodes,
+          solid: true
+        });
+      });
+      li.appendChild(btn);
+      els.hitList.appendChild(li);
+    });
+
+    // 无法判定列表
+    if (unds.length === 0) {
+      var tipU = document.createElement('li');
+      tipU.className = 'empty-tip';
+      tipU.textContent = '没有无法判定的节点。';
+      els.hitUndeterminedList.appendChild(tipU);
+    }
+    unds.forEach(function (u) {
+      var meta = HIT_REASON_META[u.reason] || { label: u.reason, cls: '' };
+      var li = document.createElement('li');
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'diff-item ' + meta.cls;
+
+      var line = document.createElement('span');
+      var no = document.createElement('span');
+      no.className = 'step-no';
+      no.textContent = String(u.step);
+      line.appendChild(no);
+      line.appendChild(document.createTextNode(' ' + (u.label || '')));
+      var badge = document.createElement('span');
+      badge.className = 'type-badge ' + meta.cls;
+      badge.textContent = meta.label;
+      line.appendChild(badge);
+      btn.appendChild(line);
+
+      var detail = document.createElement('span');
+      detail.className = 'diff-detail';
+      detail.textContent = u.message;
+      btn.appendChild(detail);
+
+      // 存在逐采样点结果（closed 根 / 归属无法确认）时附明细
+      if (u.samples && u.samples.length > 0) {
+        var pts = document.createElement('span');
+        pts.className = 'diff-detail hit-samples';
+        pts.textContent = u.samples.map(hitSampleText).join('　');
+        btn.appendChild(pts);
+      }
+
+      if (u.selector) {
+        var sel = document.createElement('span');
+        sel.className = 'sel';
+        sel.textContent = u.selector;
+        btn.appendChild(sel);
+      }
+
+      btn.addEventListener('click', function () {
+        clearHitActive();
+        btn.classList.add('active');
+        setHitHint(HIT_SCOPE_NOTE);
+        state.highlightOrigin = 'hit';
+        sendToFrame({
+          type: 'highlight-node',
+          selector: u.selector,
+          badge: meta.label + ' · Tab ' + u.step + ' / ' + totalNodes,
+          solid: true
+        });
+      });
+      li.appendChild(btn);
+      els.hitUndeterminedList.appendChild(li);
+    });
+  }
+
   /* ---------------- 控件名称审计 ---------------- */
 
   var NAME_SOURCE_META = {
@@ -1609,6 +1863,18 @@
         undetermined: state.clipAudit.undetermined,
         stats: state.clipAudit.stats
       } : null,
+      // 焦点命中遮挡审计：采样配置（内缩比例 / 中心+四角）、逐节点命中判定
+      // （状态、可见 / 被遮挡采样点数、遮挡者、逐采样点坐标与结果、可见矩形）、
+      // 无法判定节点（零可见面积 / 裁剪无法判定 / closed 根 / 归属无法确认）；
+      // 结论仅针对采样点
+      hitAudit: state.hitAudit ? {
+        scopeNote: HIT_SCOPE_NOTE,
+        viewport: state.hitAudit.viewport,
+        inset: state.hitAudit.inset,
+        items: state.hitAudit.items,
+        undetermined: state.hitAudit.undetermined,
+        stats: state.hitAudit.stats
+      } : null,
       // 基线对比：基线摘要 + 匹配结果 + 差异（未钉基线时为 null）
       baselineComparison: state.diff ? {
         baseline: state.diff.baseline,
@@ -1653,6 +1919,7 @@
       modal: [els.tabModal, els.modalPanel],
       visual: [els.tabVisual, els.visualPanel],
       clip: [els.tabClip, els.clipPanel],
+      hit: [els.tabHit, els.hitPanel],
       name: [els.tabName, els.namePanel],
       baseline: [els.tabBaseline, els.baselinePanel]
     };
@@ -1668,6 +1935,7 @@
   els.tabModal.addEventListener('click', function () { switchTab('modal'); });
   els.tabVisual.addEventListener('click', function () { switchTab('visual'); });
   els.tabClip.addEventListener('click', function () { switchTab('clip'); });
+  els.tabHit.addEventListener('click', function () { switchTab('hit'); });
   els.tabName.addEventListener('click', function () { switchTab('name'); });
   els.tabBaseline.addEventListener('click', function () { switchTab('baseline'); });
 
@@ -1683,6 +1951,7 @@
   renderVisualAudit();
   renderNameAudit();
   renderClipAudit();
+  renderHitAudit();
 
   fetch('/analyzer.js')
     .then(function (res) {
